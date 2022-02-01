@@ -12,6 +12,6 @@ prefixsum-seq: prefixsum-seq.c secret.c
 .PHONY: run
 run: prefixsum-pthread prefixsum-seq
 	@echo --- pthread ---
-	@./prefixsum-pthread <<< "$(input)"
+	@/usr/bin/time ./prefixsum-pthread <<< "$(input)"
 	@echo --- sequntial ---
-	@./prefixsum-seq <<< "$(input)"
+	@/usr/bin/time ./prefixsum-seq <<< "$(input)"
