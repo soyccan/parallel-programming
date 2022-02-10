@@ -3,10 +3,12 @@ LDFLAGS =
 LDLIBS = -lOpenCL
 SHELL = bash
 
-EXE = run
+EXE = ./main
 
-.PHONY: all
-all: $(EXE)
 
 $(EXE): main.c
 	$(CC) $(CFLAGS) $(LDFLAGS) $(LDLIBS) $^ -o $@
+
+.PHONY: run
+run: $(EXE)
+	$(EXE)
