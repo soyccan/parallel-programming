@@ -1,8 +1,17 @@
-#include <CL/cl.h>
+// #define NDEBUG
 
+#ifdef _WIN32
+// Windows only
+#include <windows.h>
+
+#elif defined(__unix__) || defined(__unix) ||                                  \
+    (defined(__APPLE__) && defined(__MACH__))
+// Unix-like only
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+
+#endif
 
 #include <assert.h>
 #include <errno.h>
@@ -13,7 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-// #define NDEBUG
+#include <CL/cl.h>
 
 #define MAX_INFO_BUF 64
 #define MAX_DEVICES 16
@@ -45,13 +54,53 @@
     }                                                                          \
   }
 
+#define _STRINGIZE(x) #x
+#define STRINGIZE(x) _STRINGIZE(x)
+
+#ifdef _WIN32
+// Windows only
 #define syscallCheckError(command)                                             \
   {                                                                            \
     if ((command) < 0) {                                                       \
-      logerr("Error %s: Line %u in file %s", strerror(errno), __LINE__,        \
-             __FILE__);                                                        \
+      PrintLastErrorStr("Error at " __FILE__ " (" STRINGIZE(__LINE__) ")");    \
     }                                                                          \
   }
+
+#elif defined(__unix__) || defined(__unix) ||                                  \
+    (defined(__APPLE__) && defined(__MACH__))
+// Unix-like only
+#define syscallCheckError(command)                                             \
+  {                                                                            \
+    if ((command) < 0) {                                                       \
+      logerr("Error at " __FILE__ " (" STRINGIZE(__LINE__) "): %s",            \
+                                                 strerror(errno));             \
+    }                                                                          \
+  }
+#endif
+
+#ifdef _WIN32 // Windows only
+void PrintLastErrorStr(const char *msg) {
+  LPVOID errstr;
+  DWORD error = GetLastError();
+
+  FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
+                    FORMAT_MESSAGE_IGNORE_INSERTS,
+                NULL, error, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), &errstr,
+                0, NULL);
+
+  if (msg) {
+    char fmt[] = FG_RED "%s: %s" FG_RESET;
+    size_t bufsz = sizeof(fmt) + strlen(msg) + strlen(errstr) + 1;
+    char *buf = malloc(bufsz);
+    snprintf(buf, bufsz, fmt, msg, errstr);
+    fprintf(stderr, "%s", buf);
+    free(buf);
+  } else {
+    fprintf(stderr, "%s", errstr);
+  }
+  LocalFree(errstr);
+}
+#endif // ifdef _WIN32
 
 const char *clErrorStr(cl_int err) {
   switch (err) {
@@ -176,14 +225,38 @@ int main() {
 
   // kernel source
   logdbg("Reading kernel source");
+#ifdef _WIN32
+  // windows only
+  HANDLE kernelFile, kernelFileMapping;
+  DWORD kernelSrcSize;
+  const char *kernelSrc;
+  syscallCheckError(kernelFile =
+                        CreateFile("vecdot.cl", GENERIC_READ, 0, NULL,
+                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL));
+  syscallCheckError(kernelSrcSize =
+                        SetFilePointer(kernelFile, 0, NULL, FILE_END));
+  logdbg("kernel source size = %d", kernelSrcSize);
+  kernelFileMapping =
+      CreateFileMapping(kernelFile, NULL, PAGE_READONLY, 0, 0, NULL);
+  syscallCheckError(-(kernelFileMapping == NULL));
+  kernelSrc =
+      MapViewOfFile(kernelFileMapping, FILE_MAP_READ, 0, 0, 0);
+  syscallCheckError(-(kernelSrc == NULL));
+  CloseHandle(kernelFile);
+
+#elif defined(__unix__) || defined(__unix) ||                                  \
+    (defined(__APPLE__) && defined(__MACH__))
+  // unix-like only
   int kernelFd;
   off_t kernelSrcSize;
   const char *kernelSrc;
   syscallCheckError(kernelFd = open("vecdot.cl", O_RDONLY));
   syscallCheckError(kernelSrcSize = lseek(kernelFd, 0, SEEK_END));
+  logdbg("kernel source size = %d", kernelSrcSize);
   kernelSrc = mmap(NULL, kernelSrcSize, PROT_READ, MAP_PRIVATE, kernelFd, 0);
   syscallCheckError(-(kernelSrc == MAP_FAILED));
   close(kernelFd);
+#endif
 
   // program
   logdbg("Creating program");
@@ -224,6 +297,7 @@ int main() {
   cl_event memRdEvent, kernelEvent;
 
   // main program loop
+  logdbg("Entering main loop");
   int veclen = 0;
   uint32_t key1 = 0, key2 = 0;
   while (scanf("%d %" PRIu32 " %" PRIu32, &veclen, &key1, &key2) == 3) {
@@ -305,7 +379,12 @@ int main() {
   // release resources
   clReleaseContext(context);
   clReleaseCommandQueue(cmdQueue);
+#ifdef _WIN32 // Windows only
+  UnmapViewOfFile(kernelSrcs[0]);
+#elif defined(__unix__) || defined(__unix) ||                                  \
+    (defined(__APPLE__) && defined(__MACH__)) // Unix-like only
   munmap(kernelSrcs[0], kernelSrcSizes[0]);
+#endif
   clReleaseProgram(program);
   clReleaseKernel(kernel);
   clReleaseMemObject(bufResVec);
