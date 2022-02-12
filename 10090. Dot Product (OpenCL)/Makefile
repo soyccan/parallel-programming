@@ -3,12 +3,21 @@ LDFLAGS =
 LDLIBS = -lOpenCL
 SHELL = bash
 
-EXE = ./host
+MAIN_PROG = ./vecdot_cl
 
+.PHONY: all
+all: vecdot_seq vecdot_cl
 
-%: %.c
+vecdot_seq: src.c
+	$(CC) $(CFLAGS) $(LDFLAGS) $(LDLIBS) $^ -o $@
+
+vecdot_cl: host.c
 	$(CC) $(CFLAGS) $(LDFLAGS) $(LDLIBS) $^ -o $@
 
 .PHONY: run
-run: $(EXE)
-	diff <($(EXE) < $(infile).in) $(infile).out
+run: $(MAIN_PROG)
+	diff <($(MAIN_PROG) < $(infile).in) $(infile).out
+
+.PHONY: run_seq
+run_seq: $(MAIN_PROG) vecdot_seq
+	diff <($(MAIN_PROG) <<< "$(input)") <(./vecdot_seq <<< "$(input)")

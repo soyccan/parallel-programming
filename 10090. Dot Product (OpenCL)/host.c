@@ -5,14 +5,22 @@
 #include <unistd.h>
 
 #include <assert.h>
+#include <errno.h>
+#include <inttypes.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define MAX_BUF 4096
+// #define NDEBUG
+
+#define MAX_INFO_BUF 64
 #define MAX_DEVICES 16
 #define MAX_PLATFORMS 8
+#define MAX_VECLEN 16777216 // 16MB
+
+#define NANO2SEC 1000000000.0
 
 #define FG_RED "\e[31m"
 #define FG_RESET "\e[0m"
@@ -39,9 +47,8 @@
 
 #define syscallCheckError(command)                                             \
   {                                                                            \
-    ssize_t _ret = (command);                                                  \
-    if (_ret != 0) {                                                           \
-      logerr("Error %s: Line %u in file %s", strerror(_ret), __LINE__,         \
+    if ((command) < 0) {                                                       \
+      logerr("Error %s: Line %u in file %s", strerror(errno), __LINE__,        \
              __FILE__);                                                        \
     }                                                                          \
   }
@@ -116,10 +123,10 @@ const char *clErrorStr(cl_int err) {
   }
 }
 
+uint32_t resvec[MAX_VECLEN];
+
 int main() {
   cl_int ret = 0;
-  char buf[MAX_BUF];
-  size_t bufN = 0;
 
   // get platforms
   cl_platform_id platforms[MAX_PLATFORMS];
@@ -133,7 +140,8 @@ int main() {
   for (int i = 0; i < platformN; i++) {
     platform = platforms[i];
 
-    bufN = 0;
+    size_t bufN = 0;
+    char buf[MAX_INFO_BUF];
     clCheckError(
         clGetPlatformInfo(platform, CL_PLATFORM_NAME, sizeof(buf), buf, &bufN));
 
@@ -158,29 +166,29 @@ int main() {
   cl_context context = clCreateContext(NULL, gpuN, gpus, NULL, NULL, &ret);
   clCheckError(ret);
 
-  // command queues
-  logdbg("Creating command queue");
+  // command queue
+  logdbg("Creating command queue on GPU 0");
+  cl_queue_properties queueProps[] = {CL_QUEUE_PROPERTIES,
+                                      CL_QUEUE_PROFILING_ENABLE, 0};
   cl_command_queue cmdQueue =
-      clCreateCommandQueueWithProperties(context, gpus[0], NULL, &ret);
+      clCreateCommandQueueWithProperties(context, gpus[0], queueProps, &ret);
   clCheckError(ret);
 
   // kernel source
   logdbg("Reading kernel source");
-  const char *kernelSrcs[1];
-  size_t kernelSrcSizes[1];
   int kernelFd;
+  off_t kernelSrcSize;
+  const char *kernelSrc;
   syscallCheckError(kernelFd = open("vecdot.cl", O_RDONLY));
-  syscallCheckError(kernelSrcSizes[0] = lseek(kernelFd, 0, SEEK_END));
-  kernelSrcs[0] =
-      mmap(NULL, kernelSrcSizes[0], PROT_READ, MAP_PRIVATE, kernelFd, 0);
-  if (kernelSrcs[0] == MAP_FAILED) {
-    perror("");
-    assert(kernelSrcs[0] != MAP_FAILED);
-  }
+  syscallCheckError(kernelSrcSize = lseek(kernelFd, 0, SEEK_END));
+  kernelSrc = mmap(NULL, kernelSrcSize, PROT_READ, MAP_PRIVATE, kernelFd, 0);
+  syscallCheckError(-(kernelSrc == MAP_FAILED));
   close(kernelFd);
 
-  // build program
+  // program
   logdbg("Creating program");
+  const char *kernelSrcs[1] = {kernelSrc};
+  size_t kernelSrcSizes[1] = {kernelSrcSize};
   cl_program program =
       clCreateProgramWithSource(context, 1, kernelSrcs, kernelSrcSizes, &ret);
   clCheckError(ret);
@@ -189,7 +197,7 @@ int main() {
   clCheckError(ret = clBuildProgram(program, gpuN, gpus, NULL, NULL, NULL));
   if (ret != CL_SUCCESS) {
     // print log if building failed
-    logdbg("Building info of GPU %d", 0);
+    logdbg("Building info of GPU 0:");
     size_t buildLogSize = 0;
     clCheckError(clGetProgramBuildInfo(program, gpus[0], CL_PROGRAM_BUILD_LOG,
                                        0, NULL, &buildLogSize));
@@ -197,14 +205,110 @@ int main() {
     char *buildLog = calloc(buildLogSize, sizeof(char));
     clCheckError(clGetProgramBuildInfo(program, gpus[0], CL_PROGRAM_BUILD_LOG,
                                        buildLogSize, buildLog, NULL));
-    printf("%s", buildLog);
+    logdbg("%s", buildLog);
     free(buildLog);
   }
 
-  munmap(kernelSrcs[0], kernelSrcSizes[0]);
+  // kernel
+  logdbg("Creating kernel");
+  cl_kernel kernel = clCreateKernel(program, "vecdot", &ret);
+  clCheckError(ret);
+
+  // buffer
+  logdbg("Creating buffer");
+  cl_mem bufResVec =
+      clCreateBuffer(context, CL_MEM_WRITE_ONLY | CL_MEM_USE_HOST_PTR,
+                     sizeof(resvec), resvec, &ret);
+
+  // events
+  cl_event memRdEvent, kernelEvent;
+
+  // main program loop
+  int veclen = 0;
+  uint32_t key1 = 0, key2 = 0;
+  while (scanf("%d %" PRIu32 " %" PRIu32, &veclen, &key1, &key2) == 3) {
+    logdbg("\n");
+
+    // kernel arguments
+    logdbg("Setting kernel arguments");
+    clCheckError(clSetKernelArg(kernel, 0, sizeof(veclen), &veclen));
+    clCheckError(clSetKernelArg(kernel, 1, sizeof(key1), &key1));
+    clCheckError(clSetKernelArg(kernel, 2, sizeof(key2), &key2));
+    clCheckError(clSetKernelArg(kernel, 3, sizeof(bufResVec), &bufResVec));
+
+    // start kernel
+    logdbg("Starting kernel");
+    size_t global_work_size[1] = {veclen};
+    size_t local_work_size[1] = {1};
+    clCheckError(clEnqueueNDRangeKernel(cmdQueue, kernel, 1, NULL,
+                                        global_work_size, local_work_size, 0,
+                                        NULL, &kernelEvent));
+
+    // retrieve result: device -> host
+    logdbg("Retrieving result: device -> host");
+    // clCheckError(clEnqueueMigrateMemObjects(cmdQueue, 1, &bufResVec,
+    //                                         CL_MIGRATE_MEM_OBJECT_HOST, 1,
+    //                                         &kernelEvent, &memRdEvent));
+    clCheckError(clEnqueueReadBuffer(cmdQueue, bufResVec, CL_TRUE, 0,
+                                     sizeof(resvec), resvec, 1, &kernelEvent,
+                                     &memRdEvent));
+
+    logdbg("Waiting for all tasks to finish");
+    clCheckError(clFinish(cmdQueue));
+
+    // gather & reduce results
+    // TODO: parallel reduction
+    logdbg("Tasks finished, start reduction");
+    uint32_t sum = 0;
+    for (int i = 0; i < veclen; i++) {
+      // logdbg("resvec[%d] = %d", i, resvec[i]);
+      sum += resvec[i];
+    }
+    printf("%" PRIu32 "\n", sum);
+
+    // time profiling
+    cl_ulong timebase, time_;
+    clCheckError(clGetEventProfilingInfo(kernelEvent,
+                                         CL_PROFILING_COMMAND_QUEUED,
+                                         sizeof(timebase), &timebase, NULL));
+    // kernel
+    clCheckError(clGetEventProfilingInfo(
+        kernelEvent, CL_PROFILING_COMMAND_QUEUED, sizeof(time_), &time_, NULL));
+    logdbg("kernel queued: %f", (time_ - timebase) / NANO2SEC);
+    clCheckError(clGetEventProfilingInfo(
+        kernelEvent, CL_PROFILING_COMMAND_SUBMIT, sizeof(time_), &time_, NULL));
+    logdbg("kernel submit: %f", (time_ - timebase) / NANO2SEC);
+    clCheckError(clGetEventProfilingInfo(
+        kernelEvent, CL_PROFILING_COMMAND_START, sizeof(time_), &time_, NULL));
+    logdbg("kernel start: %f", (time_ - timebase) / NANO2SEC);
+    clCheckError(clGetEventProfilingInfo(kernelEvent,
+                                         CL_PROFILING_COMMAND_COMPLETE,
+                                         sizeof(time_), &time_, NULL));
+    logdbg("kernel complete: %f", (time_ - timebase) / NANO2SEC);
+
+    // retrieve result
+    clCheckError(clGetEventProfilingInfo(
+        memRdEvent, CL_PROFILING_COMMAND_QUEUED, sizeof(time_), &time_, NULL));
+    logdbg("mem read queued: %f", (time_ - timebase) / NANO2SEC);
+    clCheckError(clGetEventProfilingInfo(
+        memRdEvent, CL_PROFILING_COMMAND_SUBMIT, sizeof(time_), &time_, NULL));
+    logdbg("mem read submit: %f", (time_ - timebase) / NANO2SEC);
+    clCheckError(clGetEventProfilingInfo(memRdEvent, CL_PROFILING_COMMAND_START,
+                                         sizeof(time_), &time_, NULL));
+    logdbg("mem read start: %f", (time_ - timebase) / NANO2SEC);
+    clCheckError(clGetEventProfilingInfo(memRdEvent,
+                                         CL_PROFILING_COMMAND_COMPLETE,
+                                         sizeof(time_), &time_, NULL));
+    logdbg("mem read complete: %f", (time_ - timebase) / NANO2SEC);
+  }
+
+  // release resources
   clReleaseContext(context);
   clReleaseCommandQueue(cmdQueue);
+  munmap(kernelSrcs[0], kernelSrcSizes[0]);
   clReleaseProgram(program);
+  clReleaseKernel(kernel);
+  clReleaseMemObject(bufResVec);
 }
 
 // vim: sw=2
