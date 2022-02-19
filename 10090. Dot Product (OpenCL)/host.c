@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <CL/cl.h>
 
@@ -28,11 +29,12 @@
 #define MAX_DEVICES 16
 #define MAX_PLATFORMS 8
 #define MAX_VECLEN 16777216 // 16MB
+#define MAX_KERNELS 16
 
 #define NANO2SEC 1000000000.0
 
-#define FG_RED "\e[31m"
-#define FG_RESET "\e[0m"
+#define FG_RED "\033[31m"
+#define FG_RESET "\033[0m"
 
 #define arrsize(arr) (sizeof(arr) / sizeof(arr[0]))
 
@@ -49,8 +51,9 @@
   {                                                                            \
     cl_int _ret = (command);                                                   \
     if (_ret != CL_SUCCESS) {                                                  \
-      logerr("Error %s: Line %u in file %s", clErrorStr(_ret), __LINE__,       \
-             __FILE__);                                                        \
+      logerr("Error at " __FILE__ " (" STRINGIZE(__LINE__) "): %s",            \
+                                                 clErrorStr(_ret));            \
+      abort();                                                                 \
     }                                                                          \
   }
 
@@ -59,46 +62,35 @@
 
 #ifdef _WIN32
 // Windows only
-#define syscallCheckError(command)                                             \
+#define assert_showerr_win(expression)                                         \
   {                                                                            \
-    if ((command) < 0) {                                                       \
-      PrintLastErrorStr("Error at " __FILE__ " (" STRINGIZE(__LINE__) ")");    \
-    }                                                                          \
-  }
-
-#elif defined(__unix__) || defined(__unix) ||                                  \
-    (defined(__APPLE__) && defined(__MACH__))
-// Unix-like only
-#define syscallCheckError(command)                                             \
-  {                                                                            \
-    if ((command) < 0) {                                                       \
+    if (!(expression)) {                                                       \
       logerr("Error at " __FILE__ " (" STRINGIZE(__LINE__) "): %s",            \
-                                                 strerror(errno));             \
+                                                 GetLastErrorStr());           \
+      abort();                                                                 \
     }                                                                          \
   }
 #endif
 
+#define assert_showerr(expression)                                             \
+  {                                                                            \
+    if (!(expression)) {                                                       \
+      logerr("Error at " __FILE__ " (" STRINGIZE(__LINE__) "): %s",            \
+                                                 strerror(errno));             \
+    }                                                                          \
+  }
+
 #ifdef _WIN32 // Windows only
-void PrintLastErrorStr(const char *msg) {
-  LPVOID errstr;
+LPTSTR GetLastErrorStr() {
+  LPTSTR errstr;
   DWORD error = GetLastError();
 
   FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
                     FORMAT_MESSAGE_IGNORE_INSERTS,
-                NULL, error, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), &errstr,
-                0, NULL);
+                NULL, error, 0, (LPTSTR)&errstr, 0, NULL);
 
-  if (msg) {
-    char fmt[] = FG_RED "%s: %s" FG_RESET;
-    size_t bufsz = sizeof(fmt) + strlen(msg) + strlen(errstr) + 1;
-    char *buf = malloc(bufsz);
-    snprintf(buf, bufsz, fmt, msg, errstr);
-    fprintf(stderr, "%s", buf);
-    free(buf);
-  } else {
-    fprintf(stderr, "%s", errstr);
-  }
-  LocalFree(errstr);
+  // require manual LocalFree() by caller
+  return errstr;
 }
 #endif // ifdef _WIN32
 
@@ -230,18 +222,18 @@ int main() {
   HANDLE kernelFile, kernelFileMapping;
   DWORD kernelSrcSize;
   const char *kernelSrc;
-  syscallCheckError(kernelFile =
-                        CreateFile("vecdot.cl", GENERIC_READ, 0, NULL,
-                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL));
-  syscallCheckError(kernelSrcSize =
-                        SetFilePointer(kernelFile, 0, NULL, FILE_END));
+  kernelFile = CreateFile("vecdot.cl", GENERIC_READ, 0, NULL, OPEN_EXISTING,
+                          FILE_ATTRIBUTE_NORMAL, NULL);
+  assert_showerr_win(kernelFile != INVALID_HANDLE_VALUE);
+  kernelSrcSize = SetFilePointer(kernelFile, 0, NULL, FILE_END);
+  assert_showerr_win(kernelSrcSize != INVALID_SET_FILE_POINTER);
   logdbg("kernel source size = %d", kernelSrcSize);
   kernelFileMapping =
       CreateFileMapping(kernelFile, NULL, PAGE_READONLY, 0, 0, NULL);
-  syscallCheckError(-(kernelFileMapping == NULL));
-  kernelSrc =
-      MapViewOfFile(kernelFileMapping, FILE_MAP_READ, 0, 0, 0);
-  syscallCheckError(-(kernelSrc == NULL));
+  assert_showerr_win(kernelFileMapping != NULL);
+  kernelSrc = MapViewOfFile(kernelFileMapping, FILE_MAP_READ, 0, 0, 0);
+  assert_showerr_win(kernelSrc != NULL);
+  CloseHandle(kernelFileMapping);
   CloseHandle(kernelFile);
 
 #elif defined(__unix__) || defined(__unix) ||                                  \
@@ -250,11 +242,13 @@ int main() {
   int kernelFd;
   off_t kernelSrcSize;
   const char *kernelSrc;
-  syscallCheckError(kernelFd = open("vecdot.cl", O_RDONLY));
-  syscallCheckError(kernelSrcSize = lseek(kernelFd, 0, SEEK_END));
+  kernelFd = open("vecdot.cl", O_RDONLY);
+  assert_showerr(kernelFd >= 0);
+  kernelSrcSize = lseek(kernelFd, 0, SEEK_END);
+  assert_showerr(kernelSrcSize >= 0);
   logdbg("kernel source size = %d", kernelSrcSize);
   kernelSrc = mmap(NULL, kernelSrcSize, PROT_READ, MAP_PRIVATE, kernelFd, 0);
-  syscallCheckError(-(kernelSrc == MAP_FAILED));
+  assert_showerr(kernelSrc != MAP_FAILED);
   close(kernelFd);
 #endif
 
@@ -266,26 +260,50 @@ int main() {
       clCreateProgramWithSource(context, 1, kernelSrcs, kernelSrcSizes, &ret);
   clCheckError(ret);
 
+  // build program for GPU 0 only
   logdbg("Building program");
-  clCheckError(ret = clBuildProgram(program, gpuN, gpus, NULL, NULL, NULL));
+  clCheckError(ret = clBuildProgram(program, 1, gpus, NULL, NULL, NULL));
   if (ret != CL_SUCCESS) {
     // print log if building failed
     logdbg("Building info of GPU 0:");
     size_t buildLogSize = 0;
     clCheckError(clGetProgramBuildInfo(program, gpus[0], CL_PROGRAM_BUILD_LOG,
                                        0, NULL, &buildLogSize));
-    buildLogSize++;
-    char *buildLog = calloc(buildLogSize, sizeof(char));
+    char *buildLog = malloc(buildLogSize);
+    assert_showerr(buildLog != NULL);
     clCheckError(clGetProgramBuildInfo(program, gpus[0], CL_PROGRAM_BUILD_LOG,
                                        buildLogSize, buildLog, NULL));
-    logdbg("%s", buildLog);
+    fprintf(stderr, "%s", buildLog);
     free(buildLog);
   }
+#ifndef NDEBUG
+  // dump compiled binary into ptx instructions file
+  // compile ptx to cubin file with: nvcc -cubin -arch=sm_20 vecdot.ptx
+  // show available arch & code by: nvcc --list-gpu-arch --list-gpu-code
+  // then dissasseble cubin with: cuobjdump -sass vecdot.cubin
+  logdbg("Dumping kernel binary to file");
+  size_t programBinSize = 0;
+  clCheckError(clGetProgramInfo(program, CL_PROGRAM_BINARY_SIZES,
+                                sizeof(programBinSize), &programBinSize, NULL));
+  logdbg("kernel binary size = %lu", programBinSize);
+  char *programBin = malloc(programBinSize);
+  assert_showerr(programBin != NULL);
+  clCheckError(clGetProgramInfo(program, CL_PROGRAM_BINARIES, programBinSize,
+                                &programBin, NULL));
+  FILE *programFile = fopen("vecdot.ptx", "wb");
+  assert_showerr(programFile != NULL);
+  assert_showerr(fwrite(programBin, 1, programBinSize, programFile) ==
+                 programBinSize);
+  fclose(programFile);
+  free(programBin);
+#endif
 
   // kernel
-  logdbg("Creating kernel");
-  cl_kernel kernel = clCreateKernel(program, "vecdot", &ret);
-  clCheckError(ret);
+  logdbg("Creating kernels");
+  cl_kernel kernels[MAX_KERNELS];
+  cl_uint kernelN = 0;
+  clCheckError(
+      clCreateKernelsInProgram(program, MAX_KERNELS, kernels, &kernelN));
 
   // buffer
   logdbg("Creating buffer");
@@ -303,77 +321,83 @@ int main() {
   while (scanf("%d %" PRIu32 " %" PRIu32, &veclen, &key1, &key2) == 3) {
     logdbg("\n");
 
-    // kernel arguments
-    logdbg("Setting kernel arguments");
-    clCheckError(clSetKernelArg(kernel, 0, sizeof(veclen), &veclen));
-    clCheckError(clSetKernelArg(kernel, 1, sizeof(key1), &key1));
-    clCheckError(clSetKernelArg(kernel, 2, sizeof(key2), &key2));
-    clCheckError(clSetKernelArg(kernel, 3, sizeof(bufResVec), &bufResVec));
+    for (int i = 0; i < kernelN; i++) {
+      logdbg("\n");
 
-    // start kernel
-    logdbg("Starting kernel");
-    size_t global_work_size[1] = {veclen};
-    size_t local_work_size[1] = {1};
-    clCheckError(clEnqueueNDRangeKernel(cmdQueue, kernel, 1, NULL,
-                                        global_work_size, local_work_size, 0,
-                                        NULL, &kernelEvent));
+      cl_kernel kernel = kernels[i];
 
-    // retrieve result: device -> host
-    logdbg("Retrieving result: device -> host");
-    // clCheckError(clEnqueueMigrateMemObjects(cmdQueue, 1, &bufResVec,
-    //                                         CL_MIGRATE_MEM_OBJECT_HOST, 1,
-    //                                         &kernelEvent, &memRdEvent));
-    clCheckError(clEnqueueReadBuffer(cmdQueue, bufResVec, CL_TRUE, 0,
-                                     sizeof(resvec), resvec, 1, &kernelEvent,
-                                     &memRdEvent));
+      // kernel arguments
+      logdbg("Setting kernel arguments");
+      clCheckError(clSetKernelArg(kernel, 0, sizeof(key1), &key1));
+      clCheckError(clSetKernelArg(kernel, 1, sizeof(key2), &key2));
+      clCheckError(clSetKernelArg(kernel, 2, sizeof(bufResVec), &bufResVec));
 
-    logdbg("Waiting for all tasks to finish");
-    clCheckError(clFinish(cmdQueue));
+      // start kernel
+      logdbg("Starting kernel %d", i);
+      size_t global_work_size[1] = {veclen};
+      size_t local_work_size[1] = {1};
+      clCheckError(clEnqueueNDRangeKernel(cmdQueue, kernel, 1, NULL,
+                                          global_work_size, local_work_size, 0,
+                                          NULL, &kernelEvent));
 
-    // gather & reduce results
-    // TODO: parallel reduction
-    logdbg("Tasks finished, start reduction");
-    uint32_t sum = 0;
-    for (int i = 0; i < veclen; i++) {
-      // logdbg("resvec[%d] = %d", i, resvec[i]);
-      sum += resvec[i];
+      // retrieve result: device -> host
+      logdbg("Retrieving result: device -> host");
+      // clCheckError(clEnqueueMigrateMemObjects(cmdQueue, 1, &bufResVec,
+      //                                         CL_MIGRATE_MEM_OBJECT_HOST, 1,
+      //                                         &kernelEvent, &memRdEvent));
+      clCheckError(clEnqueueReadBuffer(cmdQueue, bufResVec, CL_TRUE, 0,
+                                       sizeof(resvec[0]), resvec, 1,
+                                       &kernelEvent, &memRdEvent));
+
+      logdbg("Waiting for all tasks to finish");
+      clCheckError(clFinish(cmdQueue));
+
+      // print result
+      logdbg("Tasks finished");
+      printf("%" PRIu32 "\n", resvec[0]);
+
+      // time profiling
+      cl_ulong timebase, time_;
+      clCheckError(clGetEventProfilingInfo(kernelEvent,
+                                           CL_PROFILING_COMMAND_QUEUED,
+                                           sizeof(timebase), &timebase, NULL));
+      // kernel
+      clCheckError(clGetEventProfilingInfo(kernelEvent,
+                                           CL_PROFILING_COMMAND_QUEUED,
+                                           sizeof(time_), &time_, NULL));
+      logdbg("kernel %d queued: %f", i, (time_ - timebase) / NANO2SEC);
+      clCheckError(clGetEventProfilingInfo(kernelEvent,
+                                           CL_PROFILING_COMMAND_SUBMIT,
+                                           sizeof(time_), &time_, NULL));
+      logdbg("kernel %d submit: %f", i, (time_ - timebase) / NANO2SEC);
+      clCheckError(clGetEventProfilingInfo(kernelEvent,
+                                           CL_PROFILING_COMMAND_START,
+                                           sizeof(time_), &time_, NULL));
+      logdbg("kernel %d start: %f", i, (time_ - timebase) / NANO2SEC);
+      clCheckError(clGetEventProfilingInfo(kernelEvent,
+                                           CL_PROFILING_COMMAND_COMPLETE,
+                                           sizeof(time_), &time_, NULL));
+      logdbg("kernel %d complete: %f", i, (time_ - timebase) / NANO2SEC);
+
+      // retrieve result
+      clCheckError(clGetEventProfilingInfo(memRdEvent,
+                                           CL_PROFILING_COMMAND_QUEUED,
+                                           sizeof(time_), &time_, NULL));
+      logdbg("mem read queued: %f", (time_ - timebase) / NANO2SEC);
+      clCheckError(clGetEventProfilingInfo(memRdEvent,
+                                           CL_PROFILING_COMMAND_SUBMIT,
+                                           sizeof(time_), &time_, NULL));
+      logdbg("mem read submit: %f", (time_ - timebase) / NANO2SEC);
+      clCheckError(clGetEventProfilingInfo(
+          memRdEvent, CL_PROFILING_COMMAND_START, sizeof(time_), &time_, NULL));
+      logdbg("mem read start: %f", (time_ - timebase) / NANO2SEC);
+      clCheckError(clGetEventProfilingInfo(memRdEvent,
+                                           CL_PROFILING_COMMAND_COMPLETE,
+                                           sizeof(time_), &time_, NULL));
+      logdbg("mem read complete: %f", (time_ - timebase) / NANO2SEC);
+
+      kernels[i] = kernel;
     }
-    printf("%" PRIu32 "\n", sum);
-
-    // time profiling
-    cl_ulong timebase, time_;
-    clCheckError(clGetEventProfilingInfo(kernelEvent,
-                                         CL_PROFILING_COMMAND_QUEUED,
-                                         sizeof(timebase), &timebase, NULL));
-    // kernel
-    clCheckError(clGetEventProfilingInfo(
-        kernelEvent, CL_PROFILING_COMMAND_QUEUED, sizeof(time_), &time_, NULL));
-    logdbg("kernel queued: %f", (time_ - timebase) / NANO2SEC);
-    clCheckError(clGetEventProfilingInfo(
-        kernelEvent, CL_PROFILING_COMMAND_SUBMIT, sizeof(time_), &time_, NULL));
-    logdbg("kernel submit: %f", (time_ - timebase) / NANO2SEC);
-    clCheckError(clGetEventProfilingInfo(
-        kernelEvent, CL_PROFILING_COMMAND_START, sizeof(time_), &time_, NULL));
-    logdbg("kernel start: %f", (time_ - timebase) / NANO2SEC);
-    clCheckError(clGetEventProfilingInfo(kernelEvent,
-                                         CL_PROFILING_COMMAND_COMPLETE,
-                                         sizeof(time_), &time_, NULL));
-    logdbg("kernel complete: %f", (time_ - timebase) / NANO2SEC);
-
-    // retrieve result
-    clCheckError(clGetEventProfilingInfo(
-        memRdEvent, CL_PROFILING_COMMAND_QUEUED, sizeof(time_), &time_, NULL));
-    logdbg("mem read queued: %f", (time_ - timebase) / NANO2SEC);
-    clCheckError(clGetEventProfilingInfo(
-        memRdEvent, CL_PROFILING_COMMAND_SUBMIT, sizeof(time_), &time_, NULL));
-    logdbg("mem read submit: %f", (time_ - timebase) / NANO2SEC);
-    clCheckError(clGetEventProfilingInfo(memRdEvent, CL_PROFILING_COMMAND_START,
-                                         sizeof(time_), &time_, NULL));
-    logdbg("mem read start: %f", (time_ - timebase) / NANO2SEC);
-    clCheckError(clGetEventProfilingInfo(memRdEvent,
-                                         CL_PROFILING_COMMAND_COMPLETE,
-                                         sizeof(time_), &time_, NULL));
-    logdbg("mem read complete: %f", (time_ - timebase) / NANO2SEC);
   }
 
   // release resources
@@ -386,7 +410,9 @@ int main() {
   munmap(kernelSrcs[0], kernelSrcSizes[0]);
 #endif
   clReleaseProgram(program);
-  clReleaseKernel(kernel);
+  for (int i = 0; i < kernelN; i++) {
+    clReleaseKernel(kernels[i]);
+  }
   clReleaseMemObject(bufResVec);
 }
 

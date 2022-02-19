@@ -1,6 +1,9 @@
 {
     "C_Cpp.clang_format_style": "llvm",
     "files.associations": {
-        "windows.h": "c"
-    }
+        "windows.h": "c",
+        "cstdint": "c",
+        "*.cl": "c"
+    },
+    "cmake.sourceDirectory": "${workspaceFolder}/10090. Dot Product (OpenCL)"
 }
